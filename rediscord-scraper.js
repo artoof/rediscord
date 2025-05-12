@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ReDiscord Scraper
 // @namespace    https://github.com/artoof
-// @version      3.2.5
+// @version      3.5.1
 // @description  Convenient Rediscord scraper of messages from channels with GUI
 // @author       artoof
 // @match        https://discord.com/*
@@ -9,15 +9,19 @@
 // ==/UserScript==
 
 (() => {
-  let token = null; // Is this global token always the right one? Feels like something could go wrong, but... maybe not?
+  let token = null;
   let scraping = false;
   let stopRequested = false;
   let allMessages = [];
   let lastBefore = null;
   let attempts = 0;
+  let exportFormat = 'txt';
+  let lastTokenInput = '';
+  let tokenCheckTimeout = null;
+  let tokenValid = false;
 
-  let gui, logConsole, btnStart, btnStop, selectChannel, inputStartId, inputEndId, inputDelay, inputToken;
-  let progressText, downloadedCountText;
+  let gui, logConsole, btnStart, btnStop, selectChannel, inputStartId, inputEndId, inputDelay, inputToken, selectExport;
+  let progressText, downloadedCountText, channelLabel;
 
   function logToConsole(...args) {
     if (!logConsole) return;
@@ -32,10 +36,15 @@
   function errorLogToConsole(...args) {
     if (!logConsole) return;
     const msg = args.map(a => (typeof a === 'object' ? JSON.stringify(a, null, 2) : a)).join(' ');
-    const line = document.createElement('div'); // Hardcoded API version again. Do not mind me
+    const line = document.createElement('div');
     line.textContent = msg;
-    line.style.color = 'red';
+    line.style.color = '#ed4245';
     line.style.whiteSpace = 'pre-wrap';
+    line.style.cursor = 'pointer';
+    line.title = 'Click to copy error';
+    line.addEventListener('click', () => {
+      navigator.clipboard.writeText(line.textContent || '').catch(() => {});
+    });
     logConsole.appendChild(line);
     logConsole.scrollTop = logConsole.scrollHeight;
   }
@@ -86,11 +95,22 @@
       await sleep(retryAfter);
       return fetchGuildChannels(guildId);
     }
+    if (response.status === 401) {
+      errorLogToConsole('Token is invalid!');
+      tokenValid = false;
+      throw new Error('Token is invalid!');
+    }
+    if (response.status === 400) {
+      errorLogToConsole('Error fetching channels 400: Not on a server page. Please navigate to a Discord server channel and re-enter your token.');
+      tokenValid = false;
+      throw new Error('Error fetching channels 400: Not on a server page.');
+    }
     if (!response.ok) {
       const text = await response.text();
       errorLogToConsole(`Error fetching channels: ${response.status} ${response.statusText}`, text);
       throw new Error(`Error fetching channels: ${response.status} ${response.statusText}`);
     }
+    tokenValid = true;
     const data = await response.json();
     return data.filter(c => c.type === 0);
   }
@@ -141,6 +161,40 @@
     return input.value.trim();
   }
 
+  function clearLogs() {
+    if (logConsole) logConsole.innerHTML = '';
+  }
+
+  function saveMessages(messages, guildId, channelId, olderId, newerId, format = 'txt') {
+    let blob, filename;
+    if (format === 'json') {
+      const jsonArr = messages.map(m => ({
+        datetime: m.timestamp,
+        nickname: m.author.username,
+        userid: m.author.id,
+        message: m.content,
+        messageid: m.id
+      }));
+      blob = new Blob([JSON.stringify(jsonArr, null, 2)], { type: 'application/json' });
+      filename = `rediscord_scrape_${guildId}_${channelId}_${olderId}_${newerId}.json`;
+    } else {
+      const result = messages.map(m => {
+        const date = new Date(m.timestamp).toLocaleString();
+        const author = `${m.author.username}#${m.author.discriminator} (${m.author.id})`;
+        const content = m.content || '[Empty message]';
+        return `${date} | ${author}\n${content}\n[Message ID: ${m.id}]`;
+      }).join('\n\n');
+      blob = new Blob([result], { type: 'text/plain' });
+      filename = `rediscord_scrape_${guildId}_${channelId}_${olderId}_${newerId}.txt`;
+    }
+    const link = document.createElement('a');
+    link.href = URL.createObjectURL(blob);
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+  }
+
   async function startScraping() {
     if (scraping) return;
     scraping = true;
@@ -148,6 +202,10 @@
     allMessages = [];
     lastBefore = null;
     attempts = 0;
+    clearLogs();
+
+    setInputsDisabled(true);
+    inputDelay.disabled = false;
 
     btnStart.disabled = true;
     btnStop.disabled = false;
@@ -162,6 +220,7 @@
       btnStop.disabled = true;
       progressText.textContent = '';
       downloadedCountText.textContent = '';
+      setInputsDisabled(false);
       return;
     }
 
@@ -173,6 +232,7 @@
       btnStop.disabled = true;
       progressText.textContent = '';
       downloadedCountText.textContent = '';
+      setInputsDisabled(false);
       return;
     }
     const channelId = channelOption.value;
@@ -190,6 +250,7 @@
       btnStop.disabled = true;
       progressText.textContent = '';
       downloadedCountText.textContent = '';
+      setInputsDisabled(false);
       return;
     }
     if (isNaN(delayMs) || delayMs < 0) {
@@ -199,6 +260,7 @@
       btnStop.disabled = true;
       progressText.textContent = '';
       downloadedCountText.textContent = '';
+      setInputsDisabled(false);
       return;
     }
     if (!tokenValue) {
@@ -208,6 +270,7 @@
       btnStop.disabled = true;
       progressText.textContent = '';
       downloadedCountText.textContent = '';
+      setInputsDisabled(false);
       return;
     }
 
@@ -237,7 +300,6 @@
           break;
         }
 
-        // Filter out media-only messages
         const filtered = messages.filter(m => {
           return snowflakeCompare(m.id, olderId) >= 0 &&
             snowflakeCompare(m.id, newerId) <= 0 &&
@@ -256,7 +318,7 @@
         }
         lastBefore = minId;
 
-        if (messages.some(m => m.id === olderId)) { // We need to trust this most shittiest check i've ever wrote in my life!
+        if (messages.some(m => m.id === olderId)) {
           logToConsole(`Found oldest ID ${olderId}, finishing download`);
           break;
         }
@@ -276,6 +338,7 @@
         btnStop.disabled = true;
         progressText.textContent = '';
         downloadedCountText.textContent = '';
+        setInputsDisabled(false);
         return;
       }
 
@@ -296,6 +359,7 @@
         btnStop.disabled = true;
         progressText.textContent = '';
         downloadedCountText.textContent = '';
+        setInputsDisabled(false);
         return;
       }
 
@@ -306,24 +370,9 @@
 
       logToConsole(`Total messages to save: ${messagesToSave.length}`);
 
-      const result = messagesToSave.map(m => {
-        const date = new Date(m.timestamp).toLocaleString();
-        const author = `${m.author.username}#${m.author.discriminator} (${m.author.id})`;
-        const content = m.content || '[Empty message]';
-        return `${date} | ${author}\n${content}\n[Message ID: ${m.id}]`;
-      }).join('\n\n');
+      saveMessages(messagesToSave, guildId, channelId, olderId, newerId, exportFormat);
 
-      const blob = new Blob([result], { type: 'text/plain' });
-      const link = document.createElement('a');
-      link.href = URL.createObjectURL(blob);
-      link.download = `rediscord_scrape_${guildId}_${channelId}_${olderId}_${newerId}.txt`;
-      document.body.appendChild(link);
-      link.click();
-      link.remove();
-
-      alert(`Saved messages: ${messagesToSave.length}`);
-      logToConsole('Script finished successfully');
-      progressText.textContent = 'Done. File saved.';
+      progressText.textContent = `Done. File saved. (${messagesToSave.length} messages)`;
     } catch (e) {
       alert('Error: ' + e.message);
       errorLogToConsole('Error during scraping:', e);
@@ -332,6 +381,7 @@
       scraping = false;
       btnStart.disabled = false;
       btnStop.disabled = true;
+      setInputsDisabled(false);
     }
   }
 
@@ -341,10 +391,39 @@
     logToConsole('Scraping stop requested...');
     btnStop.disabled = true;
     progressText.textContent += ' (Stopping...)';
+
+    setTimeout(() => {
+      if (allMessages.length > 0) {
+        const guildId = getGuildIdFromURL();
+        const channelId = selectChannel.selectedOptions[0]?.value || 'unknown';
+        const startId = getInputTrimmed(inputStartId);
+        const endId = getInputTrimmed(inputEndId);
+        const cmp = snowflakeCompare(startId, endId);
+        const olderId = cmp < 0 ? startId : endId;
+        const newerId = cmp < 0 ? endId : startId;
+        saveMessages(allMessages, guildId, channelId, olderId, newerId, exportFormat);
+        progressText.textContent = `Stopped. Partial file saved. (${allMessages.length} messages)`;
+      } else {
+        progressText.textContent = 'Stopped. No messages saved.';
+      }
+      scraping = false;
+      btnStart.disabled = false;
+      btnStop.disabled = true;
+      setInputsDisabled(false);
+    }, 500);
+  }
+
+  function setInputsDisabled(disabled) {
+    inputToken.disabled = disabled;
+    selectChannel.disabled = disabled || selectChannel.options.length === 0 || selectChannel.options[0].text === 'Insert your token first' || selectChannel.options[0].text === 'Not on a server page' || selectChannel.options[0].text === 'Error loading channels' || selectChannel.options[0].text === 'No text channels found';
+    inputStartId.disabled = disabled;
+    inputEndId.disabled = disabled;
+    selectExport.disabled = disabled;
+    inputDelay.disabled = false;
   }
 
   function createGUI() {
-    if (gui) return; // If GUI exists it's okay, if it is not then we crash
+    if (gui) return;
 
     gui = document.createElement('div');
     gui.style.position = 'fixed';
@@ -362,17 +441,41 @@
     gui.style.color = 'white';
     gui.style.boxShadow = '0 0 10px rgba(0,0,0,0.8)';
     gui.style.userSelect = 'none';
+    gui.style.minWidth = '320px';
+    gui.style.maxWidth = '90vw';
+    gui.style.maxHeight = '90vh';
+    gui.style.overflow = 'hidden';
 
     const header = document.createElement('div');
-    header.textContent = 'ReDiscord Scraper';
-    header.style.fontWeight = '700';
-    header.style.fontSize = '18px';
+    header.style.display = 'flex';
+    header.style.flexDirection = 'column';
+    header.style.justifyContent = 'center';
     header.style.padding = '10px';
     header.style.backgroundColor = '#202225';
     header.style.borderTopLeftRadius = '8px';
     header.style.borderTopRightRadius = '8px';
     header.style.cursor = 'grab';
     header.style.userSelect = 'none';
+
+    const title = document.createElement('div');
+    title.textContent = 'ReDiscord Scraper';
+    title.style.fontWeight = '700';
+    title.style.fontSize = '18px';
+    title.style.lineHeight = '1.2';
+    title.style.userSelect = 'none';
+
+    const subtitle = document.createElement('div');
+    subtitle.style.fontSize = '11px';
+    subtitle.style.color = '#72767d';
+    subtitle.style.userSelect = 'none';
+    subtitle.style.fontWeight = '400';
+    subtitle.style.fontFamily = 'Arial, sans-serif';
+    subtitle.style.marginTop = '-2px';
+    subtitle.innerHTML = `by artoof v3.5.1 - <a href="https://github.com/artoof" target="_blank" rel="noopener noreferrer" style="color:#5865f2; text-decoration:none;">GitHub</a>`;
+
+    header.appendChild(title);
+    header.appendChild(subtitle);
+
     gui.appendChild(header);
 
     makeDraggable(gui, header);
@@ -383,15 +486,18 @@
     form.style.display = 'flex';
     form.style.flexDirection = 'column';
     form.style.gap = '8px';
+    form.style.maxHeight = '320px';
+    form.style.overflowY = 'auto';
+    form.style.background = 'linear-gradient(to bottom, #2f3136 90%, #23272a 100%)';
 
     const inputTokenObj = createLabeledInput('Discord Token:', 'password');
     inputToken = inputTokenObj.input;
     form.appendChild(inputTokenObj.container);
 
-    const channelLabel = document.createElement('label');
-    channelLabel.textContent = 'Select Channel:';
+    channelLabel = document.createElement('label');
     channelLabel.style.fontSize = '13px';
     channelLabel.style.userSelect = 'none';
+    channelLabel.style.marginTop = '0';
     form.appendChild(channelLabel);
 
     selectChannel = document.createElement('select');
@@ -402,12 +508,57 @@
     selectChannel.style.color = 'white';
     selectChannel.style.fontSize = '14px';
     selectChannel.style.width = '100%';
+    selectChannel.style.boxSizing = 'border-box';
+    selectChannel.style.fontStyle = 'normal';
+    selectChannel.disabled = true;
     form.appendChild(selectChannel);
 
-    inputToken.addEventListener('change', loadChannels); // I hope you don't paste some extra in the token field cuz this thing will fuck you up and I just don't want to fix it
-    setTimeout(() => {
-      if (inputToken.value.trim()) loadChannels();
-    }, 300);
+    const exportLabel = document.createElement('label');
+    exportLabel.textContent = 'Export Format:';
+    exportLabel.style.fontSize = '13px';
+    exportLabel.style.userSelect = 'none';
+    exportLabel.style.marginTop = '0';
+    form.appendChild(exportLabel);
+
+    selectExport = document.createElement('select');
+    selectExport.style.padding = '6px 8px';
+    selectExport.style.borderRadius = '4px';
+    selectExport.style.border = '1px solid #40444b';
+    selectExport.style.backgroundColor = '#202225';
+    selectExport.style.color = 'white';
+    selectExport.style.fontSize = '14px';
+    selectExport.style.width = '100%';
+    selectExport.style.boxSizing = 'border-box';
+    selectExport.innerHTML = `
+      <option value="txt">.txt</option>
+      <option value="json">.json</option>
+    `;
+    selectExport.addEventListener('change', () => {
+      exportFormat = selectExport.value;
+    });
+    form.appendChild(selectExport);
+
+    inputToken.addEventListener('input', () => {
+      if (tokenCheckTimeout) clearTimeout(tokenCheckTimeout);
+      tokenCheckTimeout = setTimeout(() => {
+        const val = inputToken.value.trim();
+        if (val !== lastTokenInput) {
+          lastTokenInput = val;
+          if (val.length === 0) {
+            selectChannel.innerHTML = '';
+            selectChannel.disabled = true;
+            selectChannel.style.fontStyle = 'italic';
+            selectChannel.innerHTML = '<option>Insert your token first</option>';
+            channelLabel.textContent = 'Select Channel:';
+            btnStart.disabled = true;
+            btnStop.disabled = true;
+          } else {
+            btnStart.disabled = false;
+            loadChannels();
+          }
+        }
+      }, 3000);
+    });
 
     const inputStartIdObj = createLabeledInput('Start Message ID:');
     inputStartId = inputStartIdObj.input;
@@ -426,11 +577,11 @@
     btnContainer.style.display = 'flex';
     btnContainer.style.justifyContent = 'space-between';
     btnContainer.style.marginTop = '10px';
+    btnContainer.style.gap = '10px';
 
     btnStart = document.createElement('button');
     btnStart.textContent = 'Start Scraping';
     btnStart.style.flex = '1';
-    btnStart.style.marginRight = '10px';
     btnStart.style.backgroundColor = '#5865f2';
     btnStart.style.color = 'white';
     btnStart.style.border = 'none';
@@ -439,6 +590,8 @@
     btnStart.style.fontWeight = '600';
     btnStart.style.fontSize = '16px';
     btnStart.style.padding = '10px 0';
+    btnStart.style.minWidth = '0';
+    btnStart.disabled = true;
     btnStart.onclick = () => {
       btnStart.disabled = true;
       btnStop.disabled = false;
@@ -456,110 +609,107 @@
     btnStop.style.fontWeight = '600';
     btnStop.style.fontSize = '16px';
     btnStop.style.padding = '10px 0';
+    btnStop.style.minWidth = '0';
     btnStop.disabled = true;
     btnStop.onclick = stopScraping;
 
     btnContainer.appendChild(btnStart);
     btnContainer.appendChild(btnStop);
-
     form.appendChild(btnContainer);
+
+    progressText = document.createElement('div');
+    progressText.style.fontSize = '14px';
+    progressText.style.fontWeight = 'bold';
+    progressText.style.margin = '8px 0 2px 0';
+    progressText.style.whiteSpace = 'nowrap';
+    progressText.style.overflow = 'hidden';
+    progressText.style.textOverflow = 'ellipsis';
+    form.appendChild(progressText);
+
+    downloadedCountText = document.createElement('div');
+    downloadedCountText.style.fontSize = '13px';
+    downloadedCountText.style.marginBottom = '2px';
+    downloadedCountText.style.whiteSpace = 'nowrap';
+    downloadedCountText.style.overflow = 'hidden';
+    downloadedCountText.style.textOverflow = 'ellipsis';
+    form.appendChild(downloadedCountText);
 
     gui.appendChild(form);
 
-    progressText = document.createElement('div');
-    progressText.style.color = '#b9bbbe';
-    progressText.style.fontSize = '14px';
-    progressText.style.padding = '6px 10px';
-    progressText.style.userSelect = 'none';
-    gui.appendChild(progressText);
-
     logConsole = document.createElement('div');
-    logConsole.style.flex = '1 1 auto';
-    logConsole.style.backgroundColor = '#1e1f22';
-    logConsole.style.margin = '10px';
-    logConsole.style.padding = '8px';
+    logConsole.style.flex = '1 1 0';
+    logConsole.style.background = '#23272a';
     logConsole.style.borderRadius = '6px';
+    logConsole.style.padding = '8px';
+    logConsole.style.margin = '10px';
     logConsole.style.overflowY = 'auto';
     logConsole.style.fontSize = '12px';
     logConsole.style.fontFamily = 'monospace';
-    logConsole.style.whiteSpace = 'pre-wrap';
+    logConsole.style.height = '100%';
+    logConsole.style.border = '1px solid #202225';
+    logConsole.style.boxSizing = 'border-box';
+
     gui.appendChild(logConsole);
 
-    downloadedCountText = document.createElement('div');
-    downloadedCountText.style.color = '#b9bbbe';
-    downloadedCountText.style.fontSize = '14px';
-    downloadedCountText.style.padding = '6px 10px';
-    downloadedCountText.style.userSelect = 'none';
-    downloadedCountText.textContent = 'Downloaded messages: 0';
-    gui.appendChild(downloadedCountText);
+    const style = document.createElement('style');
+    style.innerHTML = `
+      div[style*="overflow-y: auto"] {
+        scrollbar-width: thin;
+        scrollbar-color: #5865f2 #23272a;
+      }
+      div[style*="overflow-y: auto"]::-webkit-scrollbar {
+        width: 10px;
+        background: transparent;
+        border-radius: 6px;
+      }
+      div[style*="overflow-y: auto"]::-webkit-scrollbar-thumb {
+        background: #5865f2;
+        border-radius: 6px;
+        border: 2px solid #23272a;
+      }
+      div[style*="overflow-y: auto"]::-webkit-scrollbar-thumb:hover {
+        background: #4752c4;
+      }
+      .channels-3g2vYe::-webkit-scrollbar-thumb {
+        background-color: #2f3136 !important;
+        border-radius: 4px !important;
+        border: 2px solid #202225 !important;
+      }
+      .channels-3g2vYe::-webkit-scrollbar {
+        background-color: transparent !important;
+        width: 8px !important;
+      }
+      .channels-3g2vYe {
+        scrollbar-width: thin !important;
+        scrollbar-color: #2f3136 transparent !important;
+      }
+      .rediscord-input-label {
+        margin-bottom: 2px !important;
+      }
+    `;
+    document.head.appendChild(style);
 
-    const closeBtn = document.createElement('button');
-    closeBtn.textContent = '×';
-    closeBtn.title = 'Close Window';
-    closeBtn.style.position = 'absolute';
-    closeBtn.style.top = '5px';
-    closeBtn.style.right = '10px';
-    closeBtn.style.background = 'transparent';
-    closeBtn.style.border = 'none';
-    closeBtn.style.color = 'white';
-    closeBtn.style.fontSize = '20px';
-    closeBtn.style.cursor = 'pointer';
-    closeBtn.style.userSelect = 'none';
-    closeBtn.onclick = () => {
-      gui.style.display = 'none';
-    };
-    gui.appendChild(closeBtn);
+    selectChannel.innerHTML = '<option>Insert your token first</option>';
+    selectChannel.style.fontStyle = 'italic';
+    selectChannel.disabled = true;
+    channelLabel.textContent = 'Select Channel:';
 
     document.body.appendChild(gui);
   }
 
-  async function loadChannels() {
-    const guildId = getGuildIdFromURL();
-    if (!guildId) {
-      logToConsole('Could not determine server ID from URL, channels not loaded');
-      return;
-    }
-    if (!token) {
-      token = getInputTrimmed(inputToken);
-      if (!token) {
-        logToConsole('Enter Discord token to load channels');
-        return;
-      }
-    }
-    try {
-      logToConsole('Loading server channels...');
-      selectChannel.disabled = true;
-      selectChannel.innerHTML = '';
-      const channels = await fetchGuildChannels(guildId);
-      if (!channels.length) {
-        logToConsole('No text channels found or no access');
-        return;
-      }
-      for (const ch of channels) {
-        const option = document.createElement('option');
-        option.value = ch.id;
-        option.textContent = `#${ch.name}`;
-        selectChannel.appendChild(option);
-      }
-      selectChannel.disabled = false;
-      logToConsole(`Loaded channels: ${channels.length}`);
-    } catch (e) {
-      errorLogToConsole('Error loading channels:', e);
-      selectChannel.disabled = true;
-    }
-  }
-
-  function createLabeledInput(labelText, type = 'text') {
+  function createLabeledInput(label, type = 'text') {
     const container = document.createElement('div');
     container.style.display = 'flex';
     container.style.flexDirection = 'column';
-
-    const label = document.createElement('label');
-    label.textContent = labelText;
-    label.style.marginBottom = '3px';
-    label.style.fontSize = '13px';
-    label.style.userSelect = 'none';
-
+    container.style.minWidth = '0';
+    const lbl = document.createElement('label');
+    lbl.textContent = label;
+    lbl.className = 'rediscord-input-label';
+    lbl.style.fontSize = '13px';
+    lbl.style.userSelect = 'none';
+    lbl.style.flexShrink = '0';
+    lbl.style.whiteSpace = 'nowrap';
+    lbl.style.marginBottom = '2px';
     const input = document.createElement('input');
     input.type = type;
     input.style.padding = '6px 8px';
@@ -568,82 +718,96 @@
     input.style.backgroundColor = '#202225';
     input.style.color = 'white';
     input.style.fontSize = '14px';
-
-    container.appendChild(label);
+    input.style.width = '100%';
+    input.style.boxSizing = 'border-box';
+    input.style.minWidth = '0';
+    container.appendChild(lbl);
     container.appendChild(input);
-
     return { container, input };
   }
 
   function makeDraggable(element, handle) {
-    let posX = 0, posY = 0, mouseX = 0, mouseY = 0;
+    let offsetX = 0, offsetY = 0, isDown = false;
+    handle.addEventListener('mousedown', function(e) {
+      isDown = true;
+      offsetX = element.offsetLeft - e.clientX;
+      offsetY = element.offsetTop - e.clientY;
+      document.body.style.userSelect = 'none';
+    });
+    document.addEventListener('mouseup', function() {
+      isDown = false;
+      document.body.style.userSelect = '';
+    });
+    document.addEventListener('mousemove', function(e) {
+      if (!isDown) return;
+      let newLeft = e.clientX + offsetX;
+      let newTop = e.clientY + offsetY;
 
-    handle.onmousedown = dragMouseDown;
+      const winW = window.innerWidth;
+      const winH = window.innerHeight;
+      const elW = element.offsetWidth;
+      const elH = element.offsetHeight;
 
-    function dragMouseDown(e) {
-      e.preventDefault();
-      mouseX = e.clientX;
-      mouseY = e.clientY;
-      document.onmouseup = closeDragElement;
-      document.onmousemove = elementDrag;
-      handle.style.cursor = 'grabbing';
-    }
-
-    function elementDrag(e) {
-      e.preventDefault();
-      posX = mouseX - e.clientX;
-      posY = mouseY - e.clientY;
-      mouseX = e.clientX;
-      mouseY = e.clientY;
-      const rect = element.getBoundingClientRect();
-      let newTop = rect.top - posY;
-      let newLeft = rect.left - posX;
-
-      const maxLeft = window.innerWidth - rect.width;
-      const maxTop = window.innerHeight - rect.height;
       if (newLeft < 0) newLeft = 0;
       if (newTop < 0) newTop = 0;
-      if (newLeft > maxLeft) newLeft = maxLeft;
-      if (newTop > maxTop) newTop = maxTop;
+      if (newLeft + elW > winW) newLeft = winW - elW;
+      if (newTop + elH > winH) newTop = winH - elH;
 
-      element.style.top = newTop + "px";
-      element.style.left = newLeft + "px";
-      element.style.right = 'auto';
+      element.style.left = newLeft + 'px';
+      element.style.top = newTop + 'px';
+      element.style.right = '';
+      element.style.bottom = '';
+    });
+  }
+
+  async function loadChannels() {
+    if (!getGuildIdFromURL()) {
+      errorLogToConsole('Error fetching channels 400: Not on a server page. Please navigate to a Discord server channel and re-enter your token.');
+      selectChannel.innerHTML = '<option>Not on a server page</option>';
+      selectChannel.disabled = true;
+      selectChannel.style.fontStyle = 'normal';
+      channelLabel.textContent = 'Select Channel:';
+      btnStart.disabled = true;
+      btnStop.disabled = true;
+      return;
     }
-
-    function closeDragElement() {
-      document.onmouseup = null;
-      document.onmousemove = null;
-      handle.style.cursor = 'grab';
+    selectChannel.innerHTML = '';
+    const guildId = getGuildIdFromURL();
+    if (!guildId) return;
+    token = inputToken.value.trim();
+    if (!token) return;
+    try {
+      const channels = await fetchGuildChannels(guildId);
+      if (channels.length === 0) {
+        selectChannel.innerHTML = '<option>No text channels found</option>';
+        selectChannel.disabled = true;
+        selectChannel.style.fontStyle = 'normal';
+        channelLabel.textContent = 'Select Channel:';
+        btnStart.disabled = true;
+        btnStop.disabled = true;
+        return;
+      }
+      channels.forEach(c => {
+        const opt = document.createElement('option');
+        opt.value = c.id;
+        opt.textContent = c.name;
+        selectChannel.appendChild(opt);
+      });
+      selectChannel.disabled = false;
+      selectChannel.style.fontStyle = 'normal';
+      channelLabel.textContent = 'Select Channel:';
+      btnStart.disabled = false;
+      logToConsole('Channels loaded');
+    } catch (e) {
+      errorLogToConsole('Failed to load channels:', e.message);
+      selectChannel.innerHTML = '<option>Error loading channels</option>';
+      selectChannel.disabled = true;
+      selectChannel.style.fontStyle = 'normal';
+      channelLabel.textContent = 'Select Channel:';
+      btnStart.disabled = true;
+      btnStop.disabled = true;
     }
   }
 
-  function addMainButton() {
-    const toolbar = document.querySelector('[class^="toolbar"]');
-    if (!toolbar || document.getElementById('rediscordScrapeBtn')) return;
-
-    const btn = document.createElement('button');
-    btn.id = 'rediscordScrapeBtn';
-    btn.textContent = 'ReDiscord Scraper';
-    btn.style.cssText = `
-      margin-left: 10px;
-      padding: 5px 12px;
-      background-color: #5865f2;
-      color: white;
-      border: none;
-      border-radius: 3px;
-      cursor: pointer;
-      font-weight: 600;
-      font-size: 14px;
-    `;
-    btn.onclick = () => {
-      if (!gui) createGUI();
-      gui.style.display = 'flex';
-    };
-    toolbar.appendChild(btn);
-  }
-
-  setInterval(addMainButton, 1000);
   createGUI();
 })();
-
